@@ -398,6 +398,24 @@ Collect all enabled collector metrics but exclude `netdev`:
 
 This can be useful for having different Prometheus servers collect specific metrics from nodes.
 
+### Runtime collector reload
+
+Collectors can be enabled and disabled at runtime through the `/-/reload` endpoint. A `POST` request swaps the active collector set atomically: a scrape that is already in flight finishes with the collector generation it started with, and new scrapes use the new generation. A single scrape never mixes two generations, and a disabled collector stops publishing metrics on subsequent scrapes.
+
+```
+curl -X POST 'http://localhost:9100/-/reload?disable=wifi&enable=mdadm'
+```
+
+The `enable` and `disable` parameters may be repeated or comma-separated. Before a newly enabled collector joins the active generation, its descriptors are validated: every metric name must keep a consistent help text, type and label set. A collector that fails validation is excluded from the new generation and reported through `node_collector_validation_error{collector="..."}` without affecting the other collectors.
+
+If the requested generation would describe an already exported metric name with a different help text or label set, the reload is rejected by default and the active generation is kept. Pass `policy=replace` to atomically replace the previous descriptor identity instead:
+
+```
+curl -X POST 'http://localhost:9100/-/reload?enable=foo&disable=bar&policy=replace'
+```
+
+A `GET` request to `/-/reload` returns the current generation, the active collectors and the validation errors of the last reload. The same state is exposed on the metrics endpoint through the `node_collector_generation`, `node_collector_active`, `node_collector_last_reload_successful`, `node_collector_last_reload_timestamp_seconds` and `node_collector_validation_error` metrics.
+
 ## Development building and running
 
 Prerequisites:

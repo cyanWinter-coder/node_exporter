@@ -875,6 +875,10 @@ node_cgroups_enabled{subsys_name="net_cls"} 1
 node_cgroups_enabled{subsys_name="perf_event"} 1
 node_cgroups_enabled{subsys_name="pids"} 1
 node_cgroups_enabled{subsys_name="rdma"} 1
+# HELP node_collector_active node_exporter: Whether the collector is part of the active scrape generation.
+# TYPE node_collector_active gauge
+# HELP node_collector_generation node_exporter: Current collector configuration generation, incremented by every applied reload.
+# TYPE node_collector_generation gauge
 # HELP node_context_switches_total Total number of context switches.
 # TYPE node_context_switches_total counter
 node_context_switches_total 3.8014093e+07

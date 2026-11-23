@@ -14,6 +14,7 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -22,7 +23,7 @@ import (
 	"os/user"
 	"runtime"
 	"slices"
-	"sort"
+	"strings"
 
 	"github.com/alecthomas/kingpin/v2"
 	"github.com/prometheus/client_golang/prometheus"
@@ -39,7 +40,10 @@ import (
 // newHandler.
 type handler struct {
 	unfilteredHandler http.Handler
-	// enabledCollectors list is used for logging and filtering
+	// manager owns the active collector generation and applies runtime
+	// reloads requested through the /-/reload endpoint.
+	manager *collector.Manager
+	// enabledCollectors list is used for startup logging
 	enabledCollectors []string
 	// exporterMetricsRegistry is a separate registry for the metrics about
 	// the exporter itself.
@@ -93,9 +97,9 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	filters := &collects
 	if len(excludes) > 0 {
-		// In exclude mode, filtered collectors = enabled - excludeed.
+		// In exclude mode, filtered collectors = active - excluded.
 		f := []string{}
-		for _, c := range h.enabledCollectors {
+		for _, c := range h.manager.Collectors() {
 			if slices.Index(excludes, c) == -1 {
 				f = append(f, c)
 			}
@@ -120,27 +124,34 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // (in which case it will log all the collectors enabled via command-line
 // flags).
 func (h *handler) innerHandler(filters ...string) (http.Handler, error) {
-	nc, err := collector.NewNodeCollector(h.logger, filters...)
-	if err != nil {
-		return nil, fmt.Errorf("couldn't create collector: %s", err)
-	}
-
-	// Only log the creation of an unfiltered handler, which should happen
-	// only once upon startup.
+	var nodeCollector prometheus.Collector
 	if len(filters) == 0 {
-		h.logger.Info("Enabled collectors")
-		for n := range nc.Collectors {
-			h.enabledCollectors = append(h.enabledCollectors, n)
+		// The unfiltered handler is created once, at startup, and owns the
+		// collector manager that runtime reloads are applied to.
+		if h.manager == nil {
+			manager, err := collector.NewManager(h.logger)
+			if err != nil {
+				return nil, fmt.Errorf("couldn't create collector: %s", err)
+			}
+			h.manager = manager
+			h.enabledCollectors = manager.Collectors()
+			h.logger.Info("Enabled collectors")
+			for _, c := range h.enabledCollectors {
+				h.logger.Info(c)
+			}
 		}
-		sort.Strings(h.enabledCollectors)
-		for _, c := range h.enabledCollectors {
-			h.logger.Info(c)
+		nodeCollector = h.manager
+	} else {
+		filtered, err := h.manager.Filtered(filters...)
+		if err != nil {
+			return nil, fmt.Errorf("couldn't create filtered collector: %s", err)
 		}
+		nodeCollector = filtered
 	}
 
 	r := prometheus.NewRegistry()
 	r.MustRegister(versioncollector.NewCollector("node_exporter"))
-	if err := r.Register(nc); err != nil {
+	if err := r.Register(nodeCollector); err != nil {
 		return nil, fmt.Errorf("couldn't register node collector: %s", err)
 	}
 
@@ -174,6 +185,59 @@ func (h *handler) innerHandler(filters ...string) (http.Handler, error) {
 	return handler, nil
 }
 
+// reloadHandler serves runtime collector reloads. GET reports the current
+// manager status; POST applies the reload described by the enable, disable
+// and policy query parameters.
+func (h *handler) reloadHandler(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		h.writeJSON(w, http.StatusOK, h.manager.Status())
+	case http.MethodPost:
+		query := r.URL.Query()
+		req := collector.ReloadRequest{
+			Enable:  splitQueryValues(query["enable"]),
+			Disable: splitQueryValues(query["disable"]),
+		}
+		if p := query.Get("policy"); p != "" {
+			policy, err := collector.ParseDuplicatePolicy(p)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			req.Policy = &policy
+		}
+		result, err := h.manager.Reload(req)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		h.writeJSON(w, http.StatusOK, result)
+	default:
+		http.Error(w, "Only GET and POST requests are supported.", http.StatusMethodNotAllowed)
+	}
+}
+
+// splitQueryValues flattens repeated and comma-separated query values.
+func splitQueryValues(values []string) []string {
+	var out []string
+	for _, value := range values {
+		for part := range strings.SplitSeq(value, ",") {
+			if part = strings.TrimSpace(part); part != "" {
+				out = append(out, part)
+			}
+		}
+	}
+	return out
+}
+
+func (h *handler) writeJSON(w http.ResponseWriter, status int, v any) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(status)
+	if err := json.NewEncoder(w).Encode(v); err != nil {
+		h.logger.Error("Couldn't encode JSON response", "err", err)
+	}
+}
+
 func main() {
 	var (
 		disableDefaultCollectors = kingpin.Flag(
@@ -201,7 +265,9 @@ func main() {
 			runtime.GOMAXPROCS(*maxProcs)
 			b.Logger.Debug("Go MAXPROCS", "procs", runtime.GOMAXPROCS(0))
 			b.Handle("/debug/pprof/", http.DefaultServeMux)
-			return newHandler(!b.DisableExporterMetrics, b.MaxRequests, b.Logger), nil
+			h := newHandler(!b.DisableExporterMetrics, b.MaxRequests, b.Logger)
+			b.HandleFunc("/-/reload", h.reloadHandler)
+			return h, nil
 		},
 	})
 

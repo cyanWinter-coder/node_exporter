@@ -14,16 +14,23 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/prometheus/procfs"
+
+	"github.com/prometheus/node_exporter/collector"
 )
 
 var binary = filepath.Join(os.Getenv("GOPATH"), "bin/node_exporter")
@@ -89,6 +96,81 @@ func TestHandlingOfDuplicatedMetrics(t *testing.T) {
 
 	if err := runCommandAndTests(exporter, address, test); err != nil {
 		t.Error(err)
+	}
+}
+
+func TestCollectorReloadEndpoint(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	h := newHandler(false, 0, logger)
+
+	scrape := func() string {
+		t.Helper()
+		recorder := httptest.NewRecorder()
+		h.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("want /metrics status code 200, have %d", recorder.Code)
+		}
+		return recorder.Body.String()
+	}
+	reload := func(query string) (int, string) {
+		t.Helper()
+		recorder := httptest.NewRecorder()
+		h.reloadHandler(recorder, httptest.NewRequest(http.MethodPost, "/-/reload?"+query, nil))
+		return recorder.Code, recorder.Body.String()
+	}
+
+	const cpuScrapeMetric = `node_scrape_collector_duration_seconds{collector="cpu"}`
+
+	if before := scrape(); !strings.Contains(before, cpuScrapeMetric) {
+		t.Skip("cpu collector not enabled on this platform")
+	}
+
+	// Disabling a collector stops publishing its metrics.
+	code, body := reload("disable=cpu")
+	if code != http.StatusOK {
+		t.Fatalf("disable reload failed: code=%d body=%s", code, body)
+	}
+	after := scrape()
+	if strings.Contains(after, cpuScrapeMetric) {
+		t.Fatal("disabled cpu collector is still published")
+	}
+	if !strings.Contains(after, "node_collector_generation") {
+		t.Fatal("collector status metrics missing from /metrics")
+	}
+
+	// The status endpoint reports the active generation.
+	recorder := httptest.NewRecorder()
+	h.reloadHandler(recorder, httptest.NewRequest(http.MethodGet, "/-/reload", nil))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status request failed: code=%d", recorder.Code)
+	}
+	var status collector.ReloadStatus
+	if err := json.Unmarshal(recorder.Body.Bytes(), &status); err != nil {
+		t.Fatalf("cannot decode status: %v", err)
+	}
+	if !status.Reloaded || slices.Contains(status.ActiveCollectors, "cpu") {
+		t.Fatalf("unexpected status after disabling cpu: %+v", status)
+	}
+
+	// Unknown collectors are rejected without touching the active generation.
+	if code, _ := reload("enable=no_such_collector"); code != http.StatusBadRequest {
+		t.Fatalf("want status 400 for unknown collector, have %d", code)
+	}
+
+	// Re-enabling restores the collector's metrics.
+	code, body = reload("enable=cpu")
+	if code != http.StatusOK {
+		t.Fatalf("enable reload failed: code=%d body=%s", code, body)
+	}
+	var result collector.ReloadResult
+	if err := json.Unmarshal([]byte(body), &result); err != nil {
+		t.Fatalf("cannot decode reload result: %v", err)
+	}
+	if reason, excluded := result.Excluded["cpu"]; excluded {
+		t.Skipf("cpu collector cannot be validated on this platform: %s", reason)
+	}
+	if restored := scrape(); !strings.Contains(restored, cpuScrapeMetric) {
+		t.Fatal("re-enabled cpu collector is not published")
 	}
 }
 

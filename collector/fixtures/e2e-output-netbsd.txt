@@ -56,6 +56,10 @@
 # TYPE go_sched_gomaxprocs_threads gauge
 # HELP go_threads Number of OS threads created.
 # TYPE go_threads gauge
+# HELP node_collector_active node_exporter: Whether the collector is part of the active scrape generation.
+# TYPE node_collector_active gauge
+# HELP node_collector_generation node_exporter: Current collector configuration generation, incremented by every applied reload.
+# TYPE node_collector_generation gauge
 # HELP node_exporter_build_info A metric with a constant '1' value labeled by version, revision, branch, goversion from which node_exporter was built, and the goos and goarch for the build.
 # TYPE node_exporter_build_info gauge
 # HELP node_memory_swap_used_bytes Memory information field swap_used_bytes.

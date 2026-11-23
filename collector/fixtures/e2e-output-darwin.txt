@@ -91,6 +91,10 @@ node_buddyinfo_blocks{node="0",size="8",zone="Normal"} 0
 node_buddyinfo_blocks{node="0",size="9",zone="DMA"} 1
 node_buddyinfo_blocks{node="0",size="9",zone="DMA32"} 0
 node_buddyinfo_blocks{node="0",size="9",zone="Normal"} 0
+# HELP node_collector_active node_exporter: Whether the collector is part of the active scrape generation.
+# TYPE node_collector_active gauge
+# HELP node_collector_generation node_exporter: Current collector configuration generation, incremented by every applied reload.
+# TYPE node_collector_generation gauge
 # HELP node_disk_read_errors_total The total number of read errors.
 # TYPE node_disk_read_errors_total counter
 node_disk_read_errors_total{device="disk0"} 0
