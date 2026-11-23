@@ -46,14 +46,16 @@ type handler struct {
 	exporterMetricsRegistry *prometheus.Registry
 	includeExporterMetrics  bool
 	maxRequests             int
+	maxResponseBytes        int64
 	logger                  *slog.Logger
 }
 
-func newHandler(includeExporterMetrics bool, maxRequests int, logger *slog.Logger) *handler {
+func newHandler(includeExporterMetrics bool, maxRequests int, maxResponseBytes int64, logger *slog.Logger) *handler {
 	h := &handler{
 		exporterMetricsRegistry: prometheus.NewRegistry(),
 		includeExporterMetrics:  includeExporterMetrics,
 		maxRequests:             maxRequests,
+		maxResponseBytes:        maxResponseBytes,
 		logger:                  logger,
 	}
 	if h.includeExporterMetrics {
@@ -146,14 +148,12 @@ func (h *handler) innerHandler(filters ...string) (http.Handler, error) {
 
 	var handler http.Handler
 	if h.includeExporterMetrics {
-		handler = promhttp.HandlerFor(
+		handler = newSnapshotHandler(
 			prometheus.Gatherers{h.exporterMetricsRegistry, r},
-			promhttp.HandlerOpts{
-				ErrorLog:            slog.NewLogLogger(h.logger.Handler(), slog.LevelError),
-				ErrorHandling:       promhttp.ContinueOnError,
-				MaxRequestsInFlight: h.maxRequests,
-				Registry:            h.exporterMetricsRegistry,
-			},
+			h.exporterMetricsRegistry,
+			h.maxRequests,
+			h.maxResponseBytes,
+			h.logger,
 		)
 		// Note that we have to use h.exporterMetricsRegistry here to
 		// use the same promhttp metrics for all expositions.
@@ -161,13 +161,12 @@ func (h *handler) innerHandler(filters ...string) (http.Handler, error) {
 			h.exporterMetricsRegistry, handler,
 		)
 	} else {
-		handler = promhttp.HandlerFor(
+		handler = newSnapshotHandler(
 			r,
-			promhttp.HandlerOpts{
-				ErrorLog:            slog.NewLogLogger(h.logger.Handler(), slog.LevelError),
-				ErrorHandling:       promhttp.ContinueOnError,
-				MaxRequestsInFlight: h.maxRequests,
-			},
+			nil,
+			h.maxRequests,
+			h.maxResponseBytes,
+			h.logger,
 		)
 	}
 
@@ -183,6 +182,10 @@ func main() {
 		maxProcs = kingpin.Flag(
 			"runtime.gomaxprocs", "The target number of CPUs Go will run on (GOMAXPROCS)",
 		).Envar("GOMAXPROCS").Default("1").Int()
+		maxResponseSize = kingpin.Flag(
+			"web.max-response-size",
+			"Maximum size in bytes of a buffered /metrics response. Larger responses are rejected with an error instead of being streamed.",
+		).Default("67108864").Int64()
 	)
 
 	kingpin.CommandLine.UsageWriter(os.Stdout)
@@ -201,7 +204,7 @@ func main() {
 			runtime.GOMAXPROCS(*maxProcs)
 			b.Logger.Debug("Go MAXPROCS", "procs", runtime.GOMAXPROCS(0))
 			b.Handle("/debug/pprof/", http.DefaultServeMux)
-			return newHandler(!b.DisableExporterMetrics, b.MaxRequests, b.Logger), nil
+			return newHandler(!b.DisableExporterMetrics, b.MaxRequests, *maxResponseSize, b.Logger), nil
 		},
 	})
 

@@ -1,5 +1,7 @@
 ## master / unreleased
 
+* [CHANGE] The /metrics endpoint now buffers the response as a bounded snapshot: response headers are only sent after collection and encoding succeed, metric families are emitted in deterministic (name-sorted) order with each family name appearing once, and oversized responses fail with a recognizable error instead of consuming unbounded memory. The buffer limit is configurable via the new `--web.max-response-size` flag (default 64 MiB).
+
 ## 1.13.1 / 2026-11-19
 
 * [BUGFIX] btrfs: Fix device_unused_bytes wrapping around during shrink #3827
