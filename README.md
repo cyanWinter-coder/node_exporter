@@ -363,6 +363,17 @@ collector will parse all files in that directory matching the glob `*.prom`
 using the [text
 format](http://prometheus.io/docs/instrumenting/exposition_formats/). **Note:** Timestamps are not supported.
 
+Files should be replaced atomically (write to a temporary name, then rename),
+as shown below. If a file is replaced or modified while it is being read, the
+collector retries the read once so that a single scrape never merges content
+from different generations of the same file. A file that fails to parse only
+removes its own metrics from that scrape; all other files are still exported.
+
+The `--collector.textfile.file-size-limit` flag sets a per-file byte budget
+(disabled by default). Files larger than the budget are skipped and reported
+via the `node_textfile_scrape_size_limit_exceeded` metric, which is only
+exported when the limit is enabled.
+
 To atomically push completion time for a cron job:
 ```
 echo my_batch_job_completion_time $(date +%s) > /path/to/directory/my_batch_job.prom.$$

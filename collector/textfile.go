@@ -16,7 +16,9 @@
 package collector
 
 import (
+	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -34,19 +36,38 @@ import (
 
 var (
 	textFileDirectories = kingpin.Flag("collector.textfile.directory", "Directory to read text files with metrics from, supports glob matching. (repeatable)").Default("").Strings()
+	textFileSizeLimit   = kingpin.Flag("collector.textfile.file-size-limit", "Maximum size in bytes of a single textfile metrics file. Larger files are skipped and reported via node_textfile_scrape_size_limit_exceeded. 0 disables the limit.").Default("0").Bytes()
 	mtimeDesc           = prometheus.NewDesc(
 		"node_textfile_mtime_seconds",
 		"Unixtime mtime of textfiles successfully read.",
 		[]string{"file"},
 		nil,
 	)
+	sizeLimitExceededDesc = prometheus.NewDesc(
+		"node_textfile_scrape_size_limit_exceeded",
+		"1 if a file exceeded the limit set by --collector.textfile.file-size-limit during the last scrape and was skipped, 0 otherwise. Only exported when the limit is enabled.",
+		nil,
+		nil,
+	)
+
+	// errFileChanged marks a read that raced with a replace or modification of
+	// the file, so the scrape must not merge content from different
+	// generations of the same file.
+	errFileChanged = errors.New("file changed while being read")
+	// errSizeLimitExceeded marks a file that is larger than the configured
+	// byte budget (--collector.textfile.file-size-limit).
+	errSizeLimitExceeded = errors.New("file size limit exceeded")
 )
 
 type textFileCollector struct {
 	paths []string
 	// Only set for testing to get predictable output.
-	mtime  *float64
-	logger *slog.Logger
+	mtime *float64
+	// sizeLimit is the per-file byte budget for parsing; 0 disables it.
+	sizeLimit uint64
+	// statAfterRead replaces the post-read os.Stat; only set for testing.
+	statAfterRead func(path string) (os.FileInfo, error)
+	logger        *slog.Logger
 }
 
 func init() {
@@ -57,8 +78,9 @@ func init() {
 // in the given textfile directory.
 func NewTextFileCollector(logger *slog.Logger) (Collector, error) {
 	c := &textFileCollector{
-		paths:  *textFileDirectories,
-		logger: logger,
+		paths:     *textFileDirectories,
+		sizeLimit: uint64(*textFileSizeLimit),
+		logger:    logger,
 	}
 	return c, nil
 }
@@ -182,8 +204,11 @@ func (c *textFileCollector) exportMTimes(mtimes map[string]time.Time, ch chan<- 
 // Update implements the Collector interface.
 func (c *textFileCollector) Update(ch chan<- prometheus.Metric) error {
 	// Iterate over files and accumulate their metrics, but also track any
-	// parsing errors so an error metric can be reported.
+	// parsing errors so an error metric can be reported. Each scrape builds a
+	// complete snapshot of the directory: metrics of files that disappeared or
+	// failed to parse are simply not part of it, so nothing stale lingers.
 	var errored bool
+	var sizeLimitExceeded bool
 	var parsedFamilies []*dto.MetricFamily
 	metricsNamesToFiles := map[string][]string{}
 	metricsNamesToHelpTexts := map[string][2]string{}
@@ -241,6 +266,9 @@ func (c *textFileCollector) Update(ch chan<- prometheus.Metric) error {
 
 			if err != nil {
 				errored = true
+				if errors.Is(err, errSizeLimitExceeded) {
+					sizeLimitExceeded = true
+				}
 				c.logger.Error("failed to collect textfile data", "file", f.Name(), "err", err)
 				continue
 			}
@@ -283,20 +311,82 @@ func (c *textFileCollector) Update(ch chan<- prometheus.Metric) error {
 		prometheus.GaugeValue, errVal,
 	)
 
+	// Only export the size limit metric when the limit is enabled, so that
+	// scrapes without a configured budget stay unchanged.
+	if c.sizeLimit > 0 {
+		var sizeLimitVal float64
+		if sizeLimitExceeded {
+			sizeLimitVal = 1.0
+		}
+		ch <- prometheus.MustNewConstMetric(
+			sizeLimitExceededDesc,
+			prometheus.GaugeValue, sizeLimitVal,
+		)
+	}
+
 	return nil
 }
 
-// processFile processes a single file, returning its modification time on success.
+// processFile reads and parses a single file, returning its modification time
+// on success. If the file is replaced or modified while it is being read, the
+// read is retried once so that a scrape never merges content from different
+// generations of the same file. On any error the returned families are nil,
+// so a failed file contributes no metrics but does not affect other files.
 func (c *textFileCollector) processFile(dir, name string) (*time.Time, map[string]*dto.MetricFamily, error) {
 	path := filepath.Join(dir, name)
+	var err error
+	for attempt := 1; attempt <= 2; attempt++ {
+		var mtime *time.Time
+		var families map[string]*dto.MetricFamily
+		mtime, families, err = c.readFileSnapshot(path)
+		if err == nil {
+			return mtime, families, nil
+		}
+		if !errors.Is(err, errFileChanged) {
+			return nil, nil, err
+		}
+		c.logger.Warn("textfile changed while being read, retrying", "file", path, "attempt", attempt)
+	}
+	return nil, nil, fmt.Errorf("file %q did not stabilize after one retry: %w", path, err)
+}
+
+// readFileSnapshot reads and parses a single file once, verifying that the
+// file's identity (device/inode) and modification generation (mtime, size)
+// are unchanged between the open and the end of the parse.
+func (c *textFileCollector) readFileSnapshot(path string) (*time.Time, map[string]*dto.MetricFamily, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to open textfile data file %q: %w", path, err)
 	}
+	// Closed on every return path, so an aborted or retried scrape never
+	// leaks the descriptor.
 	defer f.Close()
 
+	before, err := f.Stat()
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to stat %q: %w", path, err)
+	}
+
+	// Bound the parse by the configured byte budget: the limited reader
+	// allows one byte past the limit so an oversized file is detected even
+	// when its truncated content would still parse.
+	var r io.Reader = f
+	var lr *io.LimitedReader
+	if c.sizeLimit > 0 {
+		lr = &io.LimitedReader{R: f, N: int64(c.sizeLimit) + 1}
+		r = lr
+	}
+
 	parser := expfmt.NewTextParser(model.UTF8Validation)
-	families, err := parser.TextToMetricFamilies(f)
+	families, err := parser.TextToMetricFamilies(r)
+
+	// Check the budget before the parse error: once the limit is hit the
+	// file is oversized regardless of whether the truncated content still
+	// parses, and a parse failure is most likely caused by the truncation.
+	if lr != nil && lr.N <= 0 {
+		return nil, nil, fmt.Errorf("textfile data file %q is larger than the %d byte limit: %w", path, c.sizeLimit, errSizeLimitExceeded)
+	}
+
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to parse textfile data from %q: %w", path, err)
 	}
@@ -305,15 +395,32 @@ func (c *textFileCollector) processFile(dir, name string) (*time.Time, map[strin
 		return nil, nil, fmt.Errorf("textfile %q contains unsupported client-side timestamps, skipping entire file", path)
 	}
 
-	// Only stat the file once it has been parsed and validated, so that
-	// a failure does not appear fresh.
-	stat, err := f.Stat()
+	// Verify that the path still refers to the same, unmodified file we just
+	// parsed; a concurrent replace or modification means the content we read
+	// may not match any single generation of the file.
+	statAfter := os.Stat
+	if c.statAfterRead != nil {
+		statAfter = c.statAfterRead
+	}
+	after, err := statAfter(path)
 	if err != nil {
-		return nil, families, fmt.Errorf("failed to stat %q: %w", path, err)
+		return nil, nil, fmt.Errorf("failed to stat %q after reading: %w", path, err)
+	}
+	if !sameFileSnapshot(before, after) {
+		return nil, nil, errFileChanged
 	}
 
-	t := stat.ModTime()
+	t := after.ModTime()
 	return &t, families, nil
+}
+
+// sameFileSnapshot reports whether before and after describe the same file
+// (device and inode) with an unchanged modification generation (mtime and
+// size).
+func sameFileSnapshot(before, after os.FileInfo) bool {
+	return os.SameFile(before, after) &&
+		before.ModTime().Equal(after.ModTime()) &&
+		before.Size() == after.Size()
 }
 
 // hasTimestamps returns true when metrics contain unsupported timestamps.
