@@ -15,9 +15,11 @@
 package collector
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"log/slog"
+	"sort"
 	"sync"
 	"time"
 
@@ -136,25 +138,295 @@ func NewNodeCollector(logger *slog.Logger, filters ...string) (*NodeCollector, e
 	return &NodeCollector{Collectors: collectors, logger: logger}, nil
 }
 
+// NewNodeCollectorWithCollectors builds a NodeCollector from the given
+// collector instances. It is intended for tests which exercise the collection
+// machinery without going through collector registration.
+func NewNodeCollectorWithCollectors(logger *slog.Logger, collectors map[string]Collector) *NodeCollector {
+	return &NodeCollector{Collectors: collectors, logger: logger}
+}
+
 // Describe implements the prometheus.Collector interface.
 func (n NodeCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- scrapeDurationDesc
 	ch <- scrapeSuccessDesc
 }
 
+// collectorMetricChanCap mirrors the buffering prometheus.Registry uses for
+// the channel handed to Collect. Keeping the same size preserves the existing
+// backpressure behavior when a scrape is not canceled.
+const collectorMetricChanCap = 1000
+
+// maxConcurrentCollectors bounds how many collectors run at the same time;
+// any further collectors are queued and are not started once the scrape
+// context is canceled.
+const maxConcurrentCollectors = 16
+
 // Collect implements the prometheus.Collector interface.
 func (n NodeCollector) Collect(ch chan<- prometheus.Metric) {
-	wg := sync.WaitGroup{}
-	wg.Add(len(n.Collectors))
-	for name, c := range n.Collectors {
-		go func(name string, c Collector) {
-			execute(name, c, ch, n.logger)
-			wg.Done()
-		}(name, c)
-	}
-	wg.Wait()
+	n.CollectWithContext(context.Background(), ch)
 }
 
+// CollectWithContext runs all collectors under the given context. The context
+// is passed to every collector implementing ContextCollector; collectors that
+// only implement Collector run as before. Every invocation creates its own
+// internal metric and result channels, so concurrent scrapes never share a
+// channel or buffer.
+//
+// On context cancellation, queued collectors are skipped, and the running
+// collectors are left to unwind on their own. Metrics emitted before the
+// cancellation are still published, while any metric emitted afterwards is
+// dropped. Every collector which did not complete successfully gets a
+// node_scrape_collector_success metric of 0, so partial results are published
+// together with an explicit failure signal.
+func (n NodeCollector) CollectWithContext(ctx context.Context, ch chan<- prometheus.Metric) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if n.logger == nil {
+		n.logger = slog.Default()
+	}
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	metricCh := make(chan prometheus.Metric, collectorMetricChanCap)
+	// resultCh is buffered for one entry per collector so collector goroutines
+	// never block on it, even when the scrape has been canceled.
+	resultCh := make(chan collectorResult, len(n.Collectors))
+
+	// A bounded worker pool gives the collectors a real queue: at most
+	// maxConcurrentCollectors run concurrently, and queued jobs are skipped
+	// instead of started after cancellation. Job names are enqueued in sorted
+	// order so scheduling is deterministic across scrapes.
+	names := make([]string, 0, len(n.Collectors))
+	for name := range n.Collectors {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	jobs := make(chan string, len(n.Collectors))
+	for _, name := range names {
+		jobs <- name
+	}
+	close(jobs)
+
+	var wg sync.WaitGroup
+	workers := min(maxConcurrentCollectors, len(n.Collectors))
+	for range workers {
+		wg.Go(func() {
+			for name := range jobs {
+				// Do not start a queued collector once the scrape is canceled.
+				select {
+				case <-ctx.Done():
+					resultCh <- collectorResult{name: name, err: ctx.Err()}
+					continue
+				default:
+				}
+				begin := time.Now()
+				err := updateCollector(ctx, n.Collectors[name], metricCh)
+				resultCh <- collectorResult{
+					name:     name,
+					err:      err,
+					duration: time.Since(begin),
+				}
+			}
+		})
+	}
+
+	// The forwarder owns the decision of what reaches the output channel.
+	//
+	// Before stopCh closes, every metric read from metricCh is forwarded to the
+	// output channel, so it stays part of the (possibly partial) result, and
+	// backpressure on ch is preserved. Once stopCh closes, the metrics already
+	// read are flushed once in a best-effort, non-blocking pass, and everything
+	// read afterwards is discarded while still being drained, so late
+	// collectors never block on a full internal buffer.
+	//
+	// sendsDone is closed after the last possible send to ch. After it closes,
+	// nothing writes to ch anymore, even though draining may continue for a
+	// stuck context-unaware collector.
+	stopCh := make(chan struct{})
+	forwarderDone := make(chan struct{})
+	sendsDone := make(chan struct{})
+	go func() {
+		defer close(forwarderDone)
+		closeSends := sync.OnceFunc(func() { close(sendsDone) })
+
+		var queue []prometheus.Metric
+		discarding := false
+
+		for {
+			// Read phase: pull one metric (or learn the channel closed).
+			var metric prometheus.Metric
+			var ok bool
+			if discarding {
+				// After cancellation: keep draining without queuing or sending,
+				// so late collectors never block on a full internal buffer.
+				metric, ok = <-metricCh
+			} else {
+				select {
+				case <-stopCh:
+					discarding = true
+					// Flush what was accepted before the cancellation without
+					// blocking, then stop sending.
+					for len(queue) > 0 {
+						select {
+						case ch <- queue[0]:
+							queue = queue[1:]
+						default:
+							queue = nil
+						}
+					}
+					closeSends()
+					continue
+				case metric, ok = <-metricCh:
+				}
+			}
+
+			// Cancellation may already have happened while select chose a
+			// metric that was buffered. Treat that metric as late and discard
+			// it instead of forwarding it.
+			if !discarding && ctx.Err() != nil {
+				discarding = true
+				closeSends()
+			}
+
+			if discarding {
+				if !ok {
+					closeSends()
+					return
+				}
+				// Drop late metrics; the read alone keeps collectors unblocked.
+				continue
+			}
+
+			if !ok {
+				// Clean shutdown: deliver everything accepted, blocking as
+				// needed to preserve the original backpressure behavior.
+				for _, m := range queue {
+					ch <- m
+				}
+				closeSends()
+				return
+			}
+
+			queue = append(queue, metric)
+
+			// Send phase: drain the queue before reading the next metric. This
+			// is a plain blocking send; cancellation is picked up on the next
+			// outer iteration, which is sufficient because the registry keeps
+			// draining ch until Collect returns.
+			for len(queue) > 0 {
+				ch <- queue[0]
+				queue = queue[1:]
+			}
+		}
+	}()
+	// Close the internal channel once every collector worker has returned. The
+	// forwarder is the sole remaining reader and drains it (delivering in the
+	// normal phase, discarding after cancellation), so there must not be a
+	// second drain here: two readers on metricCh would swallow metrics.
+	go func() {
+		wg.Wait()
+		close(metricCh)
+	}()
+
+	pending := make(map[string]struct{}, len(n.Collectors))
+	for name := range n.Collectors {
+		pending[name] = struct{}{}
+	}
+
+	for len(pending) > 0 {
+		select {
+		case <-ctx.Done():
+			// Stop forwarding metrics emitted after the cancellation. Metrics
+			// the forwarder already accepted stay part of the partial result.
+			close(stopCh)
+
+			// Drain results already in flight so completed collectors are
+			// still reported with their real outcome.
+			for {
+				select {
+				case result := <-resultCh:
+					delete(pending, result.name)
+					n.emitStatus(ch, result)
+					continue
+				default:
+				}
+				break
+			}
+			// Everything still pending did not complete the scrape and is
+			// reported as failed explicitly.
+			for name := range pending {
+				n.emitStatus(ch, collectorResult{name: name, err: ctx.Err()})
+			}
+			// Wait until the forwarder has performed its last send. After
+			// this point nothing writes to ch anymore, even though the
+			// forwarder may keep draining for a stuck legacy collector.
+			<-sendsDone
+			return
+		case result := <-resultCh:
+			delete(pending, result.name)
+			n.emitStatus(ch, result)
+		}
+	}
+
+	// Clean shutdown: all collectors are done and the internal channel is
+	// closing; wait until every accepted metric has reached the output channel.
+	<-forwarderDone
+}
+
+// CollectContext is an alias for CollectWithContext.
+func (n NodeCollector) CollectContext(ctx context.Context, ch chan<- prometheus.Metric) {
+	n.CollectWithContext(ctx, ch)
+}
+
+type collectorResult struct {
+	name     string
+	err      error
+	duration time.Duration
+}
+
+// emitStatus sends the per-collector duration and success metrics, including
+// for collectors which did not finish a canceled scrape. The registry keeps
+// draining the output channel until Collect returns, so these are sent
+// unconditionally rather than gated on the canceled context.
+func (n NodeCollector) emitStatus(ch chan<- prometheus.Metric, result collectorResult) {
+	var success float64
+	if result.err != nil {
+		switch {
+		case IsNoDataError(result.err):
+			n.logger.Debug("collector returned no data", "name", result.name, "duration_seconds", result.duration.Seconds(), "err", result.err)
+		case errors.Is(result.err, context.Canceled), errors.Is(result.err, context.DeadlineExceeded):
+			n.logger.Debug("collector canceled", "name", result.name, "duration_seconds", result.duration.Seconds(), "err", result.err)
+		default:
+			n.logger.Error("collector failed", "name", result.name, "duration_seconds", result.duration.Seconds(), "err", result.err)
+		}
+	} else {
+		n.logger.Debug("collector succeeded", "name", result.name, "duration_seconds", result.duration.Seconds())
+		success = 1
+	}
+	ch <- prometheus.MustNewConstMetric(scrapeDurationDesc, prometheus.GaugeValue, result.duration.Seconds(), result.name)
+	ch <- prometheus.MustNewConstMetric(scrapeSuccessDesc, prometheus.GaugeValue, success, result.name)
+}
+
+// updateCollector dispatches to the supported context-aware method when the
+// collector provides one and falls back to Update otherwise, keeping the
+// existing Collector interface fully compatible.
+func updateCollector(ctx context.Context, c Collector, ch chan<- prometheus.Metric) error {
+	switch cc := c.(type) {
+	case ContextCollector:
+		return cc.UpdateContext(ctx, ch)
+	case CollectorWithContext:
+		return cc.UpdateWithContext(ctx, ch)
+	default:
+		return c.Update(ch)
+	}
+}
+
+// execute retains the pre-cancellation helper for compatibility with focused
+// collector tests and external callers that may have relied on the package
+// internal entry point.
+//
+//nolint:unused // Kept as a stable package-internal compatibility helper.
 func execute(name string, c Collector, ch chan<- prometheus.Metric, logger *slog.Logger) {
 	begin := time.Now()
 	err := c.Update(ch)
@@ -180,6 +452,27 @@ func execute(name string, c Collector, ch chan<- prometheus.Metric, logger *slog
 type Collector interface {
 	// Get new metrics and expose them via prometheus registry.
 	Update(ch chan<- prometheus.Metric) error
+}
+
+// ContextCollector is an optional extension of Collector. Collectors
+// implementing it receive the scrape context and should stop their work and
+// return once the context is canceled. Collectors only implementing Collector
+// keep working unchanged and are treated as blocking collectors on
+// cancellation.
+type ContextCollector interface {
+	Collector
+	// UpdateContext behaves like Update but honors the given context.
+	UpdateContext(ctx context.Context, ch chan<- prometheus.Metric) error
+}
+
+// CollectorWithContext is the alternate context-aware spelling. NodeCollector
+// accepts either UpdateContext or UpdateWithContext through structural type
+// assertions.
+//
+//nolint:revive // The explicit Collector prefix is the compatibility API name.
+type CollectorWithContext interface {
+	Collector
+	UpdateWithContext(ctx context.Context, ch chan<- prometheus.Metric) error
 }
 
 type typedDesc struct {

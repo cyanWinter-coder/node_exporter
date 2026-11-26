@@ -14,6 +14,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -47,6 +48,78 @@ type handler struct {
 	includeExporterMetrics  bool
 	maxRequests             int
 	logger                  *slog.Logger
+}
+
+// scrapeHandler exposes a NodeCollector through promhttp while threading the
+// request context into the scrape. promhttp.HandlerFor only accepts a
+// context-free Gatherer, so each request gets a fresh registry whose sole
+// collector invokes NodeCollector.CollectWithContext with r.Context(). This
+// also guarantees that two scrapes never share the collector's metric channel
+// or buffers.
+type scrapeHandler struct {
+	nodeCollector *collector.NodeCollector
+	opts          promhttp.HandlerOpts
+	gatherers     prometheus.Gatherers
+	// inFlightSem, when non-nil, preserves the process-wide concurrent scrape
+	// limit across the per-request promhttp handlers.
+	inFlightSem chan struct{}
+	// instrumentRegistry, when set, wraps each request with the standard
+	// promhttp request instrumentation (equivalent to InstrumentMetricHandler).
+	instrumentRegistry *prometheus.Registry
+}
+
+func (h *scrapeHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	registry := prometheus.NewRegistry()
+	registry.MustRegister(&ctxScrapeCollector{
+		ctx:  r.Context(),
+		node: h.nodeCollector,
+	})
+
+	opts := h.opts
+	if h.inFlightSem != nil {
+		// The shared semaphore below preserves the limit across per-request
+		// promhttp handlers; promhttp's own semaphore would be request-local.
+		opts.MaxRequestsInFlight = 0
+	}
+	gatherers := make(prometheus.Gatherers, 0, len(h.gatherers)+1)
+	gatherers = append(gatherers, h.gatherers...)
+	gatherers = append(gatherers, registry)
+	requestHandler := promhttp.HandlerFor(gatherers, opts)
+
+	if h.inFlightSem != nil {
+		limited := requestHandler
+		requestHandler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			select {
+			case h.inFlightSem <- struct{}{}:
+				defer func() { <-h.inFlightSem }()
+				limited.ServeHTTP(w, r)
+			default:
+				w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+				w.WriteHeader(http.StatusServiceUnavailable)
+				fmt.Fprintf(w, "Limit of concurrent requests reached (%d), try again later.\n", cap(h.inFlightSem))
+			}
+		})
+	}
+
+	if h.instrumentRegistry != nil {
+		requestHandler = promhttp.InstrumentMetricHandler(h.instrumentRegistry, requestHandler)
+	}
+	requestHandler.ServeHTTP(w, r)
+}
+
+// ctxScrapeCollector adapts a context-aware NodeCollector to the context-free
+// prometheus.Collector interface used by a registry.
+type ctxScrapeCollector struct {
+	ctx  context.Context
+	node *collector.NodeCollector
+}
+
+func (c *ctxScrapeCollector) Describe(ch chan<- *prometheus.Desc) {
+	c.node.Describe(ch)
+}
+
+func (c *ctxScrapeCollector) Collect(ch chan<- prometheus.Metric) {
+	c.node.CollectWithContext(c.ctx, ch)
 }
 
 func newHandler(includeExporterMetrics bool, maxRequests int, logger *slog.Logger) *handler {
@@ -119,7 +192,7 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // fly. The former is accomplished by calling innerHandler without any arguments
 // (in which case it will log all the collectors enabled via command-line
 // flags).
-func (h *handler) innerHandler(filters ...string) (http.Handler, error) {
+func (h *handler) innerHandler(filters ...string) (*scrapeHandler, error) {
 	nc, err := collector.NewNodeCollector(h.logger, filters...)
 	if err != nil {
 		return nil, fmt.Errorf("couldn't create collector: %s", err)
@@ -138,40 +211,34 @@ func (h *handler) innerHandler(filters ...string) (http.Handler, error) {
 		}
 	}
 
-	r := prometheus.NewRegistry()
-	r.MustRegister(versioncollector.NewCollector("node_exporter"))
-	if err := r.Register(nc); err != nil {
-		return nil, fmt.Errorf("couldn't register node collector: %s", err)
-	}
+	// The static registry holds collectors which do not need the request
+	// context; the NodeCollector itself is gathered per request instead.
+	staticRegistry := prometheus.NewRegistry()
+	staticRegistry.MustRegister(versioncollector.NewCollector("node_exporter"))
 
-	var handler http.Handler
+	gatherers := prometheus.Gatherers{staticRegistry}
+	opts := promhttp.HandlerOpts{
+		ErrorLog:            slog.NewLogLogger(h.logger.Handler(), slog.LevelError),
+		ErrorHandling:       promhttp.ContinueOnError,
+		MaxRequestsInFlight: h.maxRequests,
+	}
+	sh := &scrapeHandler{
+		nodeCollector: nc,
+		opts:          opts,
+		gatherers:     gatherers,
+	}
+	if h.maxRequests > 0 {
+		sh.inFlightSem = make(chan struct{}, h.maxRequests)
+	}
 	if h.includeExporterMetrics {
-		handler = promhttp.HandlerFor(
-			prometheus.Gatherers{h.exporterMetricsRegistry, r},
-			promhttp.HandlerOpts{
-				ErrorLog:            slog.NewLogLogger(h.logger.Handler(), slog.LevelError),
-				ErrorHandling:       promhttp.ContinueOnError,
-				MaxRequestsInFlight: h.maxRequests,
-				Registry:            h.exporterMetricsRegistry,
-			},
-		)
+		sh.gatherers = append(prometheus.Gatherers{h.exporterMetricsRegistry}, sh.gatherers...)
+		sh.opts.Registry = h.exporterMetricsRegistry
 		// Note that we have to use h.exporterMetricsRegistry here to
 		// use the same promhttp metrics for all expositions.
-		handler = promhttp.InstrumentMetricHandler(
-			h.exporterMetricsRegistry, handler,
-		)
-	} else {
-		handler = promhttp.HandlerFor(
-			r,
-			promhttp.HandlerOpts{
-				ErrorLog:            slog.NewLogLogger(h.logger.Handler(), slog.LevelError),
-				ErrorHandling:       promhttp.ContinueOnError,
-				MaxRequestsInFlight: h.maxRequests,
-			},
-		)
+		sh.instrumentRegistry = h.exporterMetricsRegistry
 	}
 
-	return handler, nil
+	return sh, nil
 }
 
 func main() {
