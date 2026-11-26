@@ -144,7 +144,7 @@ edac | Exposes error detection and correction statistics. | Linux
 entropy | Exposes available entropy. | Linux
 exec | Exposes execution statistics. | Dragonfly, FreeBSD
 fibrechannel | Exposes fibre channel information and statistics from `/sys/class/fc_host/`. | Linux
-filefd | Exposes file descriptor statistics from `/proc/sys/fs/file-nr`. | Linux
+filefd | Exposes file descriptor statistics from `/proc/sys/fs/file-nr`, plus optional consistent per-process counts from `/proc/<pid>/fd`. | Linux
 filesystem | Exposes filesystem statistics, such as disk space used. | Darwin, Dragonfly, FreeBSD, Linux, OpenBSD
 hwmon | Expose hardware monitoring and sensor data from `/sys/class/hwmon/`. | Linux
 infiniband | Exposes network statistics specific to InfiniBand and Intel OmniPath configurations. | Linux
@@ -298,6 +298,21 @@ echo default > /sys/fs/resctrl/info/L3_MON/mbm_assign_mode   # fails harmlessly 
 ```
 
 See the [kernel documentation](https://docs.kernel.org/filesystems/resctrl.html) for more details.
+
+### Filefd Collector
+
+The `filefd` collector always exports the system-wide `/proc/sys/fs/file-nr` metrics. Per-process open file descriptor counts are opt-in:
+
+```
+node_exporter --collector.filefd.process-stats
+```
+
+Each scan takes one fixed PID snapshot. Processes created after that snapshot do not enter the scrape output, and every snapshot PID is represented either by `node_filefd_process_open_fds{pid=...}` or by a skip series. Processes that vanish or deny permission are skipped with stable reasons instead of failing the collector.
+
+The scan budget is fixed when the scan starts:
+
+- `--collector.filefd.process-timeout` stops further proc directory access after the deadline.
+- `--collector.filefd.process-max-fds` bounds how many entries are read for one process; a process beyond the budget is reported with the stable `fd_limit_exceeded` skip reason instead of draining an oversized directory.
 
 ### Sysctl Collector
 
